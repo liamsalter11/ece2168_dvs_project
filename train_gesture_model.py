@@ -6,10 +6,15 @@ Fine-tunes MobileNetV2 on HaGRID gesture images and exports a quantized
 TFLite model for deployment on PC (x86), Raspberry Pi 4, and E1 EVK.
 
 ─── Data setup ────────────────────────────────────────────────────────────────
-Download the HaGRID subsample for the 5 required classes from:
-  https://github.com/hukenovs/hagrid
+Collect training data using collect_gesture_data.py before running this script:
 
-Organize images in this layout (subdirectory name = gesture class):
+  python collect_gesture_data.py --gesture palm
+  python collect_gesture_data.py --gesture fist
+  python collect_gesture_data.py --gesture one
+  python collect_gesture_data.py --gesture peace
+  python collect_gesture_data.py --gesture thumb_up
+
+This produces DVS activity map images in:
   data/
     palm/        →  OPEN_HAND
     fist/        →  FIST

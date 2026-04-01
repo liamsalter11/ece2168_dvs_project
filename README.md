@@ -34,12 +34,12 @@ Efficient Computer E1 EVK for energy comparison.
 
 ## DVS Event Format (`protocol.h`)
 
-Each event is 9 bytes, packed little-endian:
+Each event is 7 bytes, packed little-endian:
 
 | Field     | Type   | Bytes | Description                     |
 |-----------|--------|-------|---------------------------------|
-| x         | uint16 | 2     | Pixel column                    |
-| y         | uint16 | 2     | Pixel row                       |
+| x         | uint8  | 1     | Pixel column                    |
+| y         | uint8  | 1     | Pixel row                       |
 | polarity  | uint8  | 1     | 0=OFF (dimmer), 1=ON (brighter) |
 | timestamp | uint32 | 4     | Microseconds since stream start |
 
@@ -89,11 +89,6 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```
 
-Build without TFLite (classical CV only, fast configure):
-```bash
-cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_TFLITE=OFF ..
-```
-
 ### 4. Run — receiver first, then sender
 
 **Always run the receiver from the project root** so the model path resolves:
@@ -122,7 +117,6 @@ ece2168/
 ├── spi_receiver.h/cpp          # TCP packet receiver (SPI-ready interface)
 ├── gesture_kernel.h/cpp        # DVS accumulation + TFLite inference pipeline
 ├── CMakeLists.txt              # Build config (FetchContent TFLite v2.18.0)
-├── Makefile                    # Classical-CV-only quick build (no TFLite)
 ├── webcam_to_dvs.py            # Webcam → DVS event emulator (Python sender)
 ├── collect_gesture_data.py     # Training data recorder
 ├── train_gesture_model.py      # MobileNetV2 fine-tune → TFLite export

@@ -8,7 +8,6 @@
 #include "gesture_kernel.h"
 
 #include <cstring>
-#include <cmath>
 #include <cstdio>
 #include <algorithm>
 #include <queue>

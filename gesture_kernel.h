@@ -1,13 +1,12 @@
 /**
  * gesture_kernel.h — Hand gesture recognition kernel
  *
- * Classical computer vision pipeline operating on DVS event streams:
+ * DVS event pipeline operating on accumulated activity frames:
  *   1. Accumulate events into an activity heatmap with temporal decay
  *   2. Threshold to binary hand region
  *   3. Connected component labeling to find dominant blob
- *   4. Shape analysis: bounding box, fill ratio, radial profile
- *   5. Convex hull + defect counting for finger estimation
- *   6. Classify gesture from features
+ *   4. Shape analysis: bounding box, fill ratio, compactness
+ *   5. TFLite inference on resized activity frame
  *
  * Designed to be portable to embedded / FPGA HLS targets.
  */
