@@ -3,10 +3,12 @@
 // Gesture recognition firmware — E1 EVK main entry point.
 //
 // Hardware setup:
-//   SPI_1        → DVS event stream from host PC (SPI master, PINMUX_1)
-//   STDIO_UART   → Gesture result output via printf (configured by SDK init)
+//   SPI_2 / PINMUX_2 → DVS event stream from host PC via FT232H
+//                       Connects through Arduino UNO header (level-shifted, 3.3V)
+//   STDIO_UART        → Gesture result output via printf (configured by SDK init)
 //
-// Protocol: receives dvs_packet_header_t + dvs_event_t[] over SPI_1.
+// Protocol: receives dvs_packet_header_t + dvs_event_t[] over SPI in
+// DATA_ONLY slave mode (no command/dummy phase — raw bytes, CS-framed).
 
 #include "gesture_kernel.h"
 #include "protocol.h"
@@ -17,84 +19,64 @@
 #ifdef HW_BUILD
 #include <eff/drivers/spi.h>
 #include <eff/drivers/pinmux.h>
-#include <eff/arch/e1x/mmio.h>
-#include <eff/atc/atcspi200.h>
 #endif
-
-/* ── SPI_1 slave transport ────────────────────────────────────────── */
-
-#ifdef HW_BUILD
-
-static bool spi_init(void)
-{
-    eff_pinmux_set(PINMUX_1, PINMUX_SPI);
-
-    // Init with the high-level driver first (resets the peripheral, sets mode/bus)
-    eff_spi_cfg_t cfg = EFF_SPI_DEFAULTS;
-    cfg.command_mode = 0;
-    cfg.address_mode = 0;
-    cfg.bus_size     = SPI_BUS_SINGLE;
-    cfg.mode         = SPI_MODE_0;
-    if (eff_spi_init(SPI_1, &cfg) != 0) return false;
-
-    // eff_spi_cfg_t has no slave field — set TRANSFMT.SLVMODE (bit 2) directly.
-    // The clock is driven by the laptop master; the EVK just receives.
-    DEV_SPI1->TRANSFMT |= ATCSPI200_TRANSFMT_SLVMODE_MASK;
-    return true;
-}
-
-static bool spi_read(uint8_t* buf, uint32_t len)
-{
-    for (uint32_t i = 0; i < len; i++) {
-        while (DEV_SPI1->STATUS & ATCSPI200_STATUS_RXEMPTY_MASK) { /* spin */ }
-        buf[i] = (uint8_t)(DEV_SPI1->DATA & 0xFF);
-    }
-    return true;
-}
-
-#else  /* sim / native — stub */
-
-static bool spi_init(void) { return true; }
-static bool spi_read(uint8_t* buf, uint32_t len) { memset(buf, 0, len); return true; }
-
-#endif  /* HW_BUILD */
 
 /* ── Frame receive ────────────────────────────────────────────────── */
 
-/* DVS_MAX_EVENTS in protocol.h is sized for the Pi (heap allocation).
- * Cap the EVK static receive buffer to fit SRAM. */
+/* Cap per-frame events to fit static SRAM buffer. */
 #define EVK_FRAME_EVENT_CAP 2048
+
+static uint8_t s_frame_buf[DVS_HEADER_SIZE + EVK_FRAME_EVENT_CAP * DVS_EVENT_SIZE];
+
+static bool spi_init(void)
+{
+#ifndef HW_BUILD
+    return true;
+#else
+    eff_pinmux_set(PINMUX_2, PINMUX_SPI);
+
+    eff_spi_slave_cfg_t cfg = EFF_SPI_SLAVE_DEFAULTS;
+    cfg.proto     = SPI_SLAVE_DATA_ONLY;   /* no command/dummy byte from master */
+    cfg.xfer_mode = SPI_XFER_READ_ONLY;
+    cfg.bus_size  = SPI_BUS_SINGLE;
+    cfg.mode      = SPI_MODE_0;
+
+    return eff_spi_slave_init(SPI_2, &cfg) == 0;
+#endif
+}
 
 static int receive_frame(dvs_packet_header_t* header_out,
                           dvs_event_t*         events_out)
 {
-    /* 1. Read header */
-    uint8_t hdr_bytes[DVS_HEADER_SIZE];
-    if (!spi_read(hdr_bytes, DVS_HEADER_SIZE)) return -1;
+#ifndef HW_BUILD
+    return -1;
+#else
+    /* Read the entire frame in one CS-framed transaction. CS deassert after
+     * the frame acts as a natural boundary; SPIRST at the start of the next
+     * call flushes any bytes the master sent beyond EVK_FRAME_EVENT_CAP. */
+    if (eff_spi_slave_xfer(SPI_2, NULL, 0, s_frame_buf, sizeof(s_frame_buf)) < 0)
+        return -1;
 
-    if (hdr_bytes[0] != DVS_MAGIC_0 || hdr_bytes[1] != DVS_MAGIC_1)
-        return -1;  /* desync — caller should retry */
+    if (s_frame_buf[0] != DVS_MAGIC_0 || s_frame_buf[1] != DVS_MAGIC_1)
+        return -1;
 
-    header_out->magic[0]    = hdr_bytes[0];
-    header_out->magic[1]    = hdr_bytes[1];
-    header_out->frame_id    = (uint32_t)hdr_bytes[2]
-                            | ((uint32_t)hdr_bytes[3] << 8)
-                            | ((uint32_t)hdr_bytes[4] << 16)
-                            | ((uint32_t)hdr_bytes[5] << 24);
-    header_out->event_count = (uint32_t)hdr_bytes[6]
-                            | ((uint32_t)hdr_bytes[7] << 8)
-                            | ((uint32_t)hdr_bytes[8] << 16)
-                            | ((uint32_t)hdr_bytes[9] << 24);
+    header_out->magic[0]    = s_frame_buf[0];
+    header_out->magic[1]    = s_frame_buf[1];
+    header_out->frame_id    = (uint32_t)s_frame_buf[2]
+                            | ((uint32_t)s_frame_buf[3] << 8)
+                            | ((uint32_t)s_frame_buf[4] << 16)
+                            | ((uint32_t)s_frame_buf[5] << 24);
+    header_out->event_count = (uint32_t)s_frame_buf[6]
+                            | ((uint32_t)s_frame_buf[7] << 8)
+                            | ((uint32_t)s_frame_buf[8] << 16)
+                            | ((uint32_t)s_frame_buf[9] << 24);
 
     uint32_t n = header_out->event_count;
     if (n > EVK_FRAME_EVENT_CAP) n = EVK_FRAME_EVENT_CAP;
 
-    /* 2. Read events */
-    static uint8_t evt_bytes[EVK_FRAME_EVENT_CAP * DVS_EVENT_SIZE];
-    if (!spi_read(evt_bytes, n * DVS_EVENT_SIZE)) return -1;
-
+    const uint8_t* ep = s_frame_buf + DVS_HEADER_SIZE;
     for (uint32_t i = 0; i < n; i++) {
-        const uint8_t* p = evt_bytes + i * DVS_EVENT_SIZE;
+        const uint8_t* p = ep + i * DVS_EVENT_SIZE;
         events_out[i].x         = p[0];
         events_out[i].y         = p[1];
         events_out[i].polarity  = p[2];
@@ -105,18 +87,17 @@ static int receive_frame(dvs_packet_header_t* header_out,
     }
 
     return (int)n;
+#endif
 }
 
 /* ── Main ─────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-#ifdef HW_BUILD
     if (!spi_init()) {
-        printf("ERROR: SPI_1 init failed\n");
+        printf("ERROR: SPI_2 init failed\n");
         return 1;
     }
-#endif
 
     if (gesture_kernel_init() != 0) {
         printf("ERROR: gesture init failed\n");
@@ -134,7 +115,7 @@ int main(void)
     for (;;) {
         int n = receive_frame(&header, events);
         if (n < 0) {
-            continue;   /* desync — retry */
+            continue;
         }
 
         gesture_kernel_ingest(events, (uint32_t)n);
