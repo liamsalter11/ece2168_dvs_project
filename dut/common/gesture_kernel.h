@@ -22,8 +22,8 @@
 #define ACTIVITY_DECREMENT      40.0f
 #define MIN_BLOB_AREA           50
 
-#define TFLM_INPUT_W     128
-#define TFLM_INPUT_H     128
+#define TFLM_INPUT_W     96
+#define TFLM_INPUT_H     96
 #define TFLM_INPUT_CH    3
 #define TFLM_NUM_CLASSES 5
 

@@ -31,13 +31,16 @@ static const int W = DVS_FRAME_WIDTH;
 static const int H = DVS_FRAME_HEIGHT;
 static const int N = DVS_FRAME_WIDTH * DVS_FRAME_HEIGHT;
 
+/* Buffers sized to fit E1x SRAM. Pixel indices (0..W*H-1 = 0..19199) and
+ * label IDs both comfortably fit in uint16_t — using int doubles bss for no
+ * benefit. */
 static float    s_activity[N];
 static uint8_t  s_binary[N];
-static int      s_label_map[N];
+static uint16_t s_label_map[N];
 static uint8_t  s_resize_buf[TFLM_INPUT_W * TFLM_INPUT_H * TFLM_INPUT_CH];
 
-/* BFS queue — worst case all pixels */
-static int      s_bfs_queue[N];
+/* BFS queue — worst case all pixels, indices fit in uint16_t. */
+static uint16_t s_bfs_queue[N];
 
 /* ── Label mapping (matches train_gesture_model.py CLASS_NAMES sort order) ── */
 /* Keras alphabetical order: fist, one, palm, peace, thumb_up */
@@ -51,7 +54,8 @@ static const gesture_class_t kKerasToProto[TFLM_NUM_CLASSES] = {
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
-__efficient__ static void decay_activity(void)
+/* Float math — fabric supports only _Float16 add/mul, so this stays scalar. */
+static void decay_activity(void)
 {
     for (int i = 0; i < N; i++) {
         float v = s_activity[i] * ACTIVITY_DECAY_FACTOR;
@@ -59,7 +63,8 @@ __efficient__ static void decay_activity(void)
     }
 }
 
-__efficient__ static void apply_threshold(void)
+/* Float compare on the threshold; remainder is integer dilate/erode. */
+static void apply_threshold(void)
 {
     for (int i = 0; i < N; i++)
         s_binary[i] = (s_activity[i] >= ACTIVITY_THRESHOLD) ? 1 : 0;
@@ -94,7 +99,7 @@ __efficient__ static void apply_threshold(void)
 
 static int connected_components(void)
 {
-    memset(s_label_map, 0, N * sizeof(int));
+    memset(s_label_map, 0, N * sizeof(s_label_map[0]));
 
     static const int dx4[] = {-1, 1, 0, 0};
     static const int dy4[] = {0, 0, -1, 1};
@@ -134,8 +139,11 @@ static int find_largest_blob(int num_labels)
 {
     if (num_labels == 0) return 0;
 
-    static int counts[N];
-    memset(counts, 0, (num_labels + 1) * sizeof(int));
+    /* Connected-component count fits in uint16_t (worst case W*H labels of 1 px),
+     * but more realistically << 1k. Per-component pixel count fits in uint16_t
+     * (max W*H = 19200). */
+    static uint16_t counts[N];
+    memset(counts, 0, (num_labels + 1) * sizeof(counts[0]));
 
     for (int i = 0; i < N; i++)
         if (s_label_map[i] > 0)
@@ -143,7 +151,7 @@ static int find_largest_blob(int num_labels)
 
     int best = 0, best_cnt = 0;
     for (int l = 1; l <= num_labels; l++) {
-        if (counts[l] > best_cnt) { best_cnt = counts[l]; best = l; }
+        if ((int)counts[l] > best_cnt) { best_cnt = counts[l]; best = l; }
     }
 
     return (best_cnt >= MIN_BLOB_AREA) ? best : 0;
@@ -195,7 +203,8 @@ static void extract_blob_features(int label, blob_features_t* feat)
     feat->compactness  = (area > 0) ? (float)(perimeter * perimeter) / area : 0.0f;
 }
 
-__efficient__ static void resize_activity_to_model_input(void)
+/* Bilinear resize uses float arithmetic — runs on the scalar core. */
+static void resize_activity_to_model_input(void)
 {
     /* Bilinear resize: activity (W×H float [0-255])
      * → resize_buf (128×128×3 uint8, grayscale→3ch) */

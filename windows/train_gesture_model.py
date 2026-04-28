@@ -40,8 +40,8 @@ import tensorflow as tf
 from pathlib import Path
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-INPUT_SIZE        = 128     # spatial resolution (128×128×3)
-ALPHA             = 0.5     # MobileNetV2 width multiplier — 0.5 keeps model small
+INPUT_SIZE        = 96      # spatial resolution (96×96×3) — sized to fit E1x SRAM
+ALPHA             = 0.35    # MobileNetV2 width multiplier — 0.35 trims activation arena
 BATCH_SIZE        = 32
 EPOCHS_HEAD       = 10      # Phase 1: train classification head only
 EPOCHS_FINETUNE   = 10      # Phase 2: fine-tune top layers of base
