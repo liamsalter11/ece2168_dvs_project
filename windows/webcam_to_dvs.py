@@ -33,7 +33,8 @@ DVS_HEADER_FMT   = "<2sII"       # magic(2) + frame_id(4) + event_count(4)
 DVS_EVENT_FMT    = "<BBbI"       # x(1) + y(1) + polarity(1) + timestamp(4)
 DVS_HEADER_SIZE  = struct.calcsize(DVS_HEADER_FMT)
 DVS_EVENT_SIZE   = struct.calcsize(DVS_EVENT_FMT)
-DVS_MAX_EVENTS   = 65535
+DVS_MAX_EVENTS       = 65535
+EVK_SPI_MAX_EVENTS   = 500    # keep frames small to avoid SPIACTIVE hang on large transfers
 
 DEFAULT_WIDTH    = 160
 DEFAULT_HEIGHT   = 120
@@ -145,6 +146,19 @@ class SPISender:
         self._port = None
 
     def connect(self, timeout: float = 30.0):
+        # On Windows, pyusb needs libusb-1.0.dll on PATH or pre-configured.
+        # The `libusb` pip package bundles the DLL but doesn't auto-register it.
+        if sys.platform == 'win32':
+            try:
+                import libusb as _libusb
+                import os as _os
+                import usb.backend.libusb1 as _lb1
+                _dll = _libusb.dll._name
+                _os.add_dll_directory(_os.path.dirname(_dll))
+                _lb1.get_backend(find_library=lambda _: _dll)
+            except Exception:
+                pass
+
         try:
             from pyftdi.spi import SpiController
         except ImportError:
@@ -204,6 +218,8 @@ def run_with_webcam(args, sender):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             events = emulator.process_frame(gray)
+            if args.transport == "spi" and len(events) > EVK_SPI_MAX_EVENTS:
+                events = events[:EVK_SPI_MAX_EVENTS]
             packet = pack_frame_packet(frame_id, events)
 
             try:
@@ -268,6 +284,8 @@ def run_with_synthetic(args, sender):
             frame[mask2] = 150
 
             events = emulator.process_frame(frame)
+            if args.transport == "spi" and len(events) > EVK_SPI_MAX_EVENTS:
+                events = events[:EVK_SPI_MAX_EVENTS]
             packet = pack_frame_packet(frame_id, events)
 
             try:
