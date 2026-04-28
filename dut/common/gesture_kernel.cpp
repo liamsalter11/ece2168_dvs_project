@@ -23,6 +23,9 @@
 #define __efficient__
 #endif
 
+/* Probe hook — implemented in main.cpp on HW, declared here for call sites. */
+extern "C" void gesture_dbg_probe(int point);
+
 extern "C" int32_t gesture_run_inference(void* input, void* output);
 
 /* ── Static buffers ───────────────────────────────────────────────── */
@@ -64,32 +67,9 @@ __efficient__ static void apply_threshold(void)
     for (int i = 0; i < N; i++)
         s_binary[i] = (s_activity[i] >= ACTIVITY_THRESHOLD) ? 1 : 0;
 
-    /* 3×3 morphological close (dilate then erode) */
-    static uint8_t tmp[N];
-
-    /* Dilate */
-    memset(tmp, 0, N);
-    for (int y = 1; y < H - 1; y++) {
-        for (int x = 1; x < W - 1; x++) {
-            uint8_t v = 0;
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++)
-                    v |= s_binary[(y + dy) * W + (x + dx)];
-            tmp[y * W + x] = v;
-        }
-    }
-
-    /* Erode */
-    memset(s_binary, 0, N);
-    for (int y = 1; y < H - 1; y++) {
-        for (int x = 1; x < W - 1; x++) {
-            uint8_t v = 1;
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++)
-                    v &= tmp[(y + dy) * W + (x + dx)];
-            s_binary[y * W + x] = v;
-        }
-    }
+    /* Morphological close skipped: webcam-emulated DVS events are sparse
+     * (isolated points) and the erode step eliminates them all. Real DVS
+     * produces denser accumulations where close is beneficial. */
 }
 
 static int connected_components(void)
@@ -231,13 +211,22 @@ static gesture_class_t run_inference(float* confidence)
 {
     *confidence = 0.0f;
 
+    /* Define SKIP_INFERENCE at build time to return early and confirm that
+     * gesture_run_inference() is the crash site (removes CGRA call). */
+#ifdef SKIP_INFERENCE
+    return GESTURE_NONE;
+#endif
+
     /* Shift uint8 → int8 (zero-point = −128) to match model's input quant */
+    gesture_dbg_probe(1);
     static int8_t input_buf[TFLM_INPUT_W * TFLM_INPUT_H * TFLM_INPUT_CH];
     for (int i = 0; i < TFLM_INPUT_W * TFLM_INPUT_H * TFLM_INPUT_CH; i++)
         input_buf[i] = (int8_t)((int)s_resize_buf[i] - 128);
+    gesture_dbg_probe(2);
 
     int8_t output_buf[TFLM_NUM_CLASSES] = {};
     if (gesture_run_inference(input_buf, output_buf) != 0) return GESTURE_NONE;
+    gesture_dbg_probe(3);
 
     /* Dequantize int8 output (zp=−128) to [0,1] probability and find argmax */
     int best_idx = 0;
@@ -293,7 +282,7 @@ gesture_result_t gesture_kernel_classify(void)
 
     extract_blob_features(dominant, &result.features);
 
-    if (result.features.area >= MIN_BLOB_AREA * 4) {
+    if (result.features.area >= MIN_BLOB_AREA) {
         resize_activity_to_model_input();
         result.gesture = run_inference(&result.confidence);
 
