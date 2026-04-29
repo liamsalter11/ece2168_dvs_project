@@ -1,60 +1,78 @@
-# DVS Gesture Recognition — Emulated Pipeline
+# DVS Gesture Recognition
 
-Emulated event-driven gesture recognition system. A Python script converts webcam
-frames into DVS-style (Dynamic Vision Sensor) temporal contrast events and streams
-them over TCP. A C++ receiver accumulates the events and runs a TFLite ML model to
-classify hand gestures. The same C++ binary targets PC (x86), Raspberry Pi 4, and
-Efficient Computer E1 EVK for energy comparison.
+Emulated event-driven gesture recognition system. A Python script on Windows converts webcam frames into DVS-style (Dynamic Vision Sensor) temporal contrast events and streams them over TCP. Two hardware DUTs receive the events, run a TFLite gesture model, and print results to their consoles.
 
-## Architecture
+## System Overview
 
 ```
-┌─────────────────────┐       TCP/9473        ┌──────────────────────────────┐
-│  Python Sender      │ ───── DVS packets ──▶  │  C++ Receiver                │
-│  (Windows)          │   (x,y,pol,timestamp)  │  (WSL / RPi4 / E1 EVK)       │
-│                     │                        │                              │
-│  webcam → grayscale │                        │  deserialize packets         │
-│  → frame diff       │                        │  → activity heatmap (160×120)│
-│  → threshold        │                        │  → binary mask + blob detect │
-│  → DVS events       │                        │  → resize to 128×128×3       │
-│  → pack & send      │                        │  → TFLite inference          │
-└─────────────────────┘                        │  → gesture label             │
-                                               └──────────────────────────────┘
+┌──────────────────────────┐        TCP / port 9473       ┌──────────────────────────────┐
+│  Windows (webcam sender) │ ─── DVS event packets ──▶   │  DUT receiver                │
+│                          │      (x, y, pol, ts)         │                              │
+│  webcam → frame diff     │                              │  deserialize frames          │
+│  → DVS events → TCP      │                              │  → activity heatmap (160×120)│
+└──────────────────────────┘                              │  → blob detect + resize      │
+                                                          │  → TFLite inference          │
+                                                          │  → gesture label (console)   │
+                                                          └──────────────────────────────┘
 ```
+
+### DUT comparison
+
+| | Raspberry Pi 4 | Efficient Computer E1x EVK |
+|---|---|---|
+| Transport | TCP over Ethernet (`eth0`) | SPI_1 (slave, `PINMUX_1`) — laptop drives clock via FT232H |
+| Inference | TFLite v2.18.0 interpreter | `eff-import` compiled MLIR, CGRA-accelerated |
+| Output | `printf` to SSH/serial console | `printf` via STDIO_UART |
+| Build system | CMake + FetchContent | CMake + effcc SDK |
+
+Shared code: `dut/common/gesture_kernel.cpp` and `dut/common/protocol.h` compile identically on both targets.
 
 ## Recognized Gestures
 
-| Label      | Description                        |
-|------------|------------------------------------|
-| `palm`     | Open hand, all fingers spread      |
-| `fist`     | Closed hand                        |
-| `one`      | Single finger pointing             |
-| `peace`    | Two fingers (V sign)               |
-| `thumb_up` | Thumbs up                          |
+| Label | Description |
+|---|---|
+| `palm` | Open hand, all fingers spread |
+| `fist` | Closed hand |
+| `one` | Single finger pointing |
+| `peace` | Two fingers (V sign) |
+| `thumb_up` | Thumbs up |
 
-## DVS Event Format (`protocol.h`)
+---
 
-Each event is 7 bytes, packed little-endian:
+## Repository Layout
 
-| Field     | Type   | Bytes | Description                     |
-|-----------|--------|-------|---------------------------------|
-| x         | uint8  | 1     | Pixel column                    |
-| y         | uint8  | 1     | Pixel row                       |
-| polarity  | uint8  | 1     | 0=OFF (dimmer), 1=ON (brighter) |
-| timestamp | uint32 | 4     | Microseconds since stream start |
+```
+windows/                  Python sender scripts (run on Windows)
+dut/
+  common/                 Shared kernel + protocol (compiled on both DUTs)
+    protocol.h            Wire format, gesture enums
+    gesture_kernel.h/cpp  DVS accumulation + blob detect + inference pipeline
+  rpi4/                   Raspberry Pi 4 receiver
+    main.cpp              TCP transport + main loop
+    tflite_backend.cpp    gesture_run_inference() via TFLite v2.18.0
+    CMakeLists.txt
+  e1x/                    E1x EVK firmware
+    main.cpp              UART transport + main loop
+    CMakeLists.txt        eff-import model compilation + effcc build
+    kernel_util_eff.cc    Replaces <complex>-using TFLM file (no atan2l on effcc)
+    quantization_util_effcc.cc  Replaces f64-bitcast TFLM file
+    debug_log_eff.cc      Routes TFLM DebugLog through eff_uart_printf
+    compat.c              Software fmaf() for targets without hardware FMA
+    embed_model.py        Converts .tflite to C byte array (legacy TFLM path)
+```
 
-Events are batched per frame inside a 10-byte header (magic + frame_id + count),
-and each TCP message is prefixed with a 4-byte length.
+---
 
-## Quick Start
-
-### 1. Collect training data (Windows, needs webcam)
+## Step 1 — Collect training data (Windows)
 
 ```bash
-# All gestures in one session (recommended):
+cd windows
+pip install -r requirements.txt
+
+# Record all five gestures in one session (SPACE = start/stop, Q = quit)
 python collect_gesture_data.py --all
 
-# Or one at a time:
+# Or one gesture at a time:
 python collect_gesture_data.py --gesture palm
 python collect_gesture_data.py --gesture fist
 python collect_gesture_data.py --gesture one
@@ -62,97 +80,142 @@ python collect_gesture_data.py --gesture peace
 python collect_gesture_data.py --gesture thumb_up
 ```
 
-Controls: **SPACE** to start/stop recording, **Q** to quit.
-Aim for 300 frames per gesture. **Keep your hand moving** — DVS only responds to motion.
+Aim for **300 frames per gesture**. Keep your hand moving — DVS only responds to motion.
 
-### 2. Train the TFLite model (WSL, uses GPU if available)
+## Step 2 — Train the model (Windows or WSL)
 
 ```bash
 python train_gesture_model.py --data_dir data/
 ```
 
-Outputs `gesture_model.tflite` (~955 KB, int8 quantized) and `gesture_labels.txt`.
+Outputs `gesture_model.tflite` (~955 KB, int8 MobileNetV2-0.5) and `gesture_labels.txt` in the project root.
 
-> **Note:** If training data lives under OneDrive, use the full path to avoid
-> cloud-only file errors:
+> If training data is under OneDrive, use the full path:
 > ```bash
 > python train_gesture_model.py --data_dir /mnt/c/Users/<user>/OneDrive/.../data/
 > ```
 
-### 3. Build the C++ receiver (WSL)
+---
 
-First build downloads ~400 MB of TensorFlow Lite source — subsequent builds are fast.
+## Step 3 — Build and run on Raspberry Pi 4
+
+### Build
+
+Run **on the Pi** (native build):
 
 ```bash
+cd dut/rpi4
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```
 
-### 4. Run — receiver first, then sender
+The first configure downloads ~400 MB of TFLite v2.18.0 source via FetchContent. Subsequent builds are fast.
 
-**Always run the receiver from the project root** so the model path resolves:
+> **Note:** XNNPACK is disabled (`TFLITE_ENABLE_XNNPACK=OFF`) in the CMakeLists because it pulls in the `kleidiai` ARM optimization library which requires a separate download. This has no effect on inference correctness.
+
+To cross-compile from a Linux/WSL host instead:
 
 ```bash
-# Terminal 1 — WSL (receiver)
-cd /home/<user>/ece2168
-./build/gesture_receiver --model gesture_model.tflite --ascii
+sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+cd dut/rpi4
+mkdir build-cross && cd build-cross
+cmake -DCMAKE_TOOLCHAIN_FILE=../../rpi4.cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+scp gesture_receiver ../../gesture_model.tflite pi@<PI_IP>:~/
+```
 
-# Terminal 2 — Windows (sender)
-python webcam_to_dvs.py                        # live webcam
-python webcam_to_dvs.py --source synthetic     # no webcam needed
+### Run
+
+**Always run from the project root** so the default model path (`gesture_model.tflite`) resolves:
+
+```bash
+cd /home/liam/ece2168_dvs_project
+./dut/rpi4/build/gesture_receiver
+```
+
+Options:
+```
+--model PATH   TFLite model file (default: gesture_model.tflite)
+--port  PORT   TCP listen port   (default: 9473)
 ```
 
 Confirm TFLite loaded — you should see on stderr:
 ```
-[tflite] Loaded gesture_model.tflite — input [1,128,128,3] type=3
+[tflite] Loaded gesture_model.tflite — input [1,128,128,3] type=9
+[tflite] Output [5] type=9
+Gesture recognition ready (TFLite v2.18.0)
+[tcp] Listening on port 9473 ...
 ```
 
-## Project Structure
+### Stream DVS events from Windows
 
+```bash
+# In windows/ on the laptop — Raspberry Pi 4 (TCP):
+python webcam_to_dvs.py --transport tcp --host <PI_IP>
+python webcam_to_dvs.py --transport tcp --host <PI_IP> --source synthetic
+
+# E1x EVK (SPI via FT232H):
+python webcam_to_dvs.py --transport spi
+python webcam_to_dvs.py --transport spi --ftdi-url ftdi://ftdi:232h/1 --spi-freq 10000000
 ```
-ece2168/
-├── protocol.h                  # Shared wire format + gesture enum
-├── main.cpp                    # Entry point, ASCII visualizer, --model arg
-├── spi_receiver.h/cpp          # TCP packet receiver (SPI-ready interface)
-├── gesture_kernel.h/cpp        # DVS accumulation + TFLite inference pipeline
-├── CMakeLists.txt              # Build config (FetchContent TFLite v2.18.0)
-├── webcam_to_dvs.py            # Webcam → DVS event emulator (Python sender)
-├── collect_gesture_data.py     # Training data recorder
-├── train_gesture_model.py      # MobileNetV2 fine-tune → TFLite export
-├── gesture_model.tflite        # Trained model (generated, not in git)
-├── gesture_labels.txt          # Label index mapping (generated)
-└── data/                       # Training images (not in git)
-    ├── palm/
-    ├── fist/
-    ├── one/
-    ├── peace/
-    └── thumb_up/
+
+The FT232H is the SPI master; the E1x is configured as SPI slave. The default SPI clock is 10 MHz. `--ftdi-url` follows pyftdi device URL syntax — run `python -m pyftdi.ftdi` to list connected devices.
+
+Gesture output on the Pi console (printed after 2 stable consecutive classifications):
 ```
+GESTURE 1 palm 87%
+GESTURE 2 fist 91%
+```
+
+---
+
+## Step 4 — Build and run on E1x EVK
+
+Requires the Efficient Computer SDK at `~/effcc/sdk` and the `litert_effcc` Python package (provides `eff-import`).
+
+```bash
+cd dut/e1x
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+```
+
+Override the model path if it is not at the default location:
+```bash
+cmake -DDVS_MODEL_SRC=/path/to/gesture_model.tflite ..
+```
+
+Flash `gesture_recognition_fabric.hex` (CGRA-accelerated) or `gesture_recognition_scalar.hex` (scalar RISC-V).
+
+Connect UART_2 to the Windows laptop and run `webcam_to_dvs.py` with `--host` pointing at the EVK serial adapter. Gesture results appear on STDIO_UART.
+
+---
 
 ## Tuning
 
-**Python sender:**
-- `--threshold N` — Brightness change threshold (default: 15). Lower = more events.
-- `--fps N` — Target frame rate (default: 30).
-- `--width W --height H` — Frame resolution (default: 160×120).
+**Python sender** (`windows/webcam_to_dvs.py`):
+- `--threshold N` — brightness-change threshold (default 15; lower = more events)
+- `--fps N` — target frame rate (default 30)
+- `--width W --height H` — frame resolution (default 160×120)
 
-**C++ kernel (`gesture_kernel.h`, recompile after editing):**
-- `ACTIVITY_DECAY_FACTOR` — How quickly old events fade (default: 0.92).
-- `ACTIVITY_THRESHOLD` — Binary mask cutoff (default: 40.0).
-- `ACTIVITY_INCREMENT` — Energy added per ON event (default: 80.0).
-- `MIN_BLOB_AREA` — Ignore small noise blobs (default: 50 px).
+**Gesture kernel** (`dut/common/gesture_kernel.h` — recompile after editing):
+- `ACTIVITY_DECAY_FACTOR` (0.92) — how quickly old events fade
+- `ACTIVITY_THRESHOLD` (40.0) — binary mask cutoff
+- `ACTIVITY_INCREMENT` / `ACTIVITY_DECREMENT` (80 / 40) — energy per ON/OFF event
+- `MIN_BLOB_AREA` (50 px) — ignore small noise blobs
+- Blob area ≥ 200 px required before running inference
+- Confidence ≥ 55% required to report a gesture label
 
-**TFLite inference thresholds (`gesture_kernel.cpp`):**
-- Blob area ≥ 200 px required before running inference (avoids blank-frame false positives).
-- Confidence ≥ 55% required to report a gesture label.
+## Wire Protocol (`dut/common/protocol.h`)
 
-## Cross-Compilation (Raspberry Pi 4)
+Each DVS event is 7 bytes, packed little-endian:
 
-```bash
-sudo apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-mkdir build-rpi4 && cd build-rpi4
-cmake -DCMAKE_TOOLCHAIN_FILE=../rpi4.cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-scp gesture_receiver gesture_model.tflite pi@<PI_IP>:~/
-```
+| Field | Type | Bytes | Description |
+|---|---|---|---|
+| x | uint8 | 1 | Pixel column |
+| y | uint8 | 1 | Pixel row |
+| polarity | uint8 | 1 | 0 = OFF (dimmer), 1 = ON (brighter) |
+| timestamp | uint32 | 4 | Microseconds since stream start |
+
+Events are batched per frame under a 10-byte header (magic `0xAE 0xD7` + frame_id + event_count). Each TCP message is prefixed with a 4-byte length.

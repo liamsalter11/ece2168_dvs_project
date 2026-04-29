@@ -1,7 +1,13 @@
 build/
+build-*/
 data/
 __pycache__/
 *.pyc
 *.o
 *.tflite
 gesture_receiver
+gesture_labels.txt
+# E1x EVK build artifacts
+dut/e1x/bld/
+dut/e1x/build/
+.venv/
