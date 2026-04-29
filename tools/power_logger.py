@@ -99,6 +99,10 @@ def parse_args():
                         "out-of-region.")
     p.add_argument("--analyze-only", default=None, metavar="FILE",
                    help="Skip capture; analyze a previously-saved CSV.")
+    p.add_argument("--live", action="store_true",
+                   help="Open a live matplotlib dashboard (power trace + "
+                        "per-inference energy bars + running stats). Best for "
+                        "demos.  Requires matplotlib + pyserial.")
     return p.parse_args()
 
 
@@ -367,6 +371,238 @@ def analyze_file(path, region_pin):
                   f"{mean_us:.0f} µs, {mean_mJ:.4f} mJ (VDDVAR)")
 
 
+# ── Live dashboard ────────────────────────────────────────────────────────────
+
+def run_live(port, output_path, region_pin):
+    """
+    Open a matplotlib window that shows VDDVAR + SYS power as a scrolling line,
+    per-inference VDDVAR energy as a bar chart, and live running stats.  The
+    raw CSV stream is still written to output_path so the run can be replayed
+    with --analyze-only afterwards.
+    """
+    try:
+        import serial
+    except ImportError:
+        raise SystemExit("pyserial required: pip install pyserial")
+    try:
+        import matplotlib
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+    except ImportError:
+        raise SystemExit("matplotlib required for --live: pip install matplotlib")
+
+    import threading
+    import queue as _queue
+    from collections import deque
+
+    if not port:
+        port = (DEFAULT_PORT_LINUX if not sys.platform.startswith("win")
+                else None)
+    if not port:
+        raise SystemExit("ERROR: --port required on Windows (e.g. --port COM7)")
+
+    print(f"[power] live dashboard on {port}", file=sys.stderr)
+    ser = serial.Serial(port, baudrate=115200, timeout=0.05)
+
+    # Use the documented column layout — no waiting on a header that may not
+    # arrive (the programmer only emits it once per port-open).
+    cols = FALLBACK_COLS
+    idx = {c: i for i, c in enumerate(cols)}
+    ts_idx  = idx["timestamp(us)"]
+    a4_idx  = idx["aon4"]
+    pv_idx  = idx["power_var(mW)"]
+    ps_idx  = idx["power_sys(mW)"]
+    p18_idx = idx["power_1v8(mW)"]
+    pio_idx = idx["power_io(mW)"]
+
+    sample_q = _queue.Queue(maxsize=4000)
+    stop_event = threading.Event()
+
+    def reader():
+        buf = b""
+        with open(output_path, "wb") as raw_f:
+            while not stop_event.is_set():
+                chunk = ser.read(65536)
+                if chunk:
+                    raw_f.write(chunk)
+                    buf += chunk
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line = buf[:nl]
+                    buf = buf[nl + 1:]
+                    s = line.decode("ascii", errors="replace").strip()
+                    if not s or "timestamp(us)" in s:
+                        continue
+                    parts = s.split(",")
+                    if len(parts) < len(cols):
+                        continue
+                    try:
+                        t_us  = int(parts[ts_idx])
+                        aon   = parts[a4_idx].strip()
+                        p_var = float(parts[pv_idx])
+                        p_sys = float(parts[ps_idx])
+                        p_1v8 = float(parts[p18_idx])
+                        p_io  = float(parts[pio_idx])
+                    except ValueError:
+                        continue
+                    try:
+                        sample_q.put_nowait(
+                            (t_us, p_var, p_sys, p_1v8, p_io, aon))
+                    except _queue.Full:
+                        pass  # drop on burst
+
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+
+    HIST_N = 800       # ~10s at 80Hz, ~4s at 200Hz
+    t_buf    = deque(maxlen=HIST_N)
+    pvar_buf = deque(maxlen=HIST_N)
+    psys_buf = deque(maxlen=HIST_N)
+
+    rail_acc = {name: Accumulator() for name, _, _ in RAILS}
+
+    last_aon = None
+    region_start_e_mJ_var = None  # VDDVAR energy at region start
+    region_start_e_mJ_sys = None  # SYS energy at region start
+    INF_HIST = 30
+    inf_energies_var = deque(maxlen=INF_HIST)
+    inf_energies_sys = deque(maxlen=INF_HIST)
+
+    t0_us = None
+
+    plt.style.use("dark_background")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7.5))
+    fig.canvas.manager.set_window_title("E1x EVK live power")
+    fig.suptitle("E1x EVK live power", fontsize=15)
+
+    line_var, = ax1.plot([], [], lw=1.6, color="#fc9c1d",
+                         label="VDDVAR (compute)")
+    line_sys, = ax1.plot([], [], lw=1.0, color="#5fa8d3",
+                         label="SYS (whole board)")
+    ax1.set_ylabel("Power (mW)")
+    ax1.set_xlabel("time (s)")
+    ax1.legend(loc="upper right")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_ylabel("Per-inference energy (mJ) — VDDVAR")
+    ax2.set_xlabel(f"most recent inferences (max {INF_HIST})")
+    ax2.grid(True, axis="y", alpha=0.3)
+
+    txt_status = fig.text(
+        0.012, 0.012, "waiting for samples…",
+        fontsize=10, family="monospace",
+        verticalalignment="bottom",
+    )
+    plt.subplots_adjust(left=0.08, right=0.97, top=0.92, bottom=0.13,
+                        hspace=0.35)
+
+    def update(_frame):
+        nonlocal last_aon, region_start_e_mJ_var, region_start_e_mJ_sys, t0_us
+
+        # Drain everything the reader queued since the last frame.
+        drained = 0
+        while True:
+            try:
+                t_us, p_var, p_sys, p_1v8, p_io, aon = sample_q.get_nowait()
+            except _queue.Empty:
+                break
+            drained += 1
+            if t0_us is None:
+                t0_us = t_us
+            rail_acc["VDDVAR"].add(t_us, p_var)
+            rail_acc["SYS"].add(t_us, p_sys)
+            rail_acc["1V8"].add(t_us, p_1v8)
+            rail_acc["VDDIO"].add(t_us, p_io)
+
+            t_buf.append((t_us - t0_us) / 1e6)
+            pvar_buf.append(p_var)
+            psys_buf.append(p_sys)
+
+            # Per-inference region edges (default AON4 unless region_pin says 5)
+            tracked_aon = aon  # AON4
+            if region_pin == "aon5":
+                # Caller asked for AON5; we don't have it in the tuple, but
+                # the rest of the loop already ignores aon for non-aon4.
+                tracked_aon = None
+            if last_aon is not None and tracked_aon is not None and tracked_aon != last_aon:
+                if tracked_aon == "1":
+                    region_start_e_mJ_var = rail_acc["VDDVAR"].energy_mJ()
+                    region_start_e_mJ_sys = rail_acc["SYS"].energy_mJ()
+                else:
+                    if region_start_e_mJ_var is not None:
+                        inf_energies_var.append(
+                            rail_acc["VDDVAR"].energy_mJ() - region_start_e_mJ_var)
+                        inf_energies_sys.append(
+                            rail_acc["SYS"].energy_mJ() - region_start_e_mJ_sys)
+                    region_start_e_mJ_var = None
+                    region_start_e_mJ_sys = None
+            if tracked_aon is not None:
+                last_aon = tracked_aon
+
+        # Trace plot
+        line_var.set_data(list(t_buf), list(pvar_buf))
+        line_sys.set_data(list(t_buf), list(psys_buf))
+        if t_buf:
+            ax1.set_xlim(t_buf[0], max(t_buf[-1], t_buf[0] + 0.1))
+            ymax = max(max(pvar_buf, default=1.0),
+                       max(psys_buf, default=1.0)) * 1.15
+            ax1.set_ylim(0, ymax)
+
+        # Bar chart of per-inference VDDVAR energy
+        ax2.clear()
+        ax2.set_ylabel("Per-inference energy (mJ) — VDDVAR")
+        ax2.set_xlabel(f"most recent inferences (max {INF_HIST})")
+        ax2.grid(True, axis="y", alpha=0.3)
+        if inf_energies_var:
+            xs = list(range(len(inf_energies_var)))
+            ax2.bar(xs, list(inf_energies_var), color="#fc9c1d")
+            mean_e = sum(inf_energies_var) / len(inf_energies_var)
+            ax2.axhline(mean_e, color="white", linestyle="--", lw=1, alpha=0.6,
+                        label=f"mean = {mean_e:.4f} mJ")
+            ax2.legend(loc="upper right")
+            ax2.set_title(
+                f"{len(inf_energies_var)} inferences shown — "
+                f"mean VDDVAR = {mean_e:.4f} mJ"
+            )
+
+        # Status footer
+        if rail_acc["VDDVAR"].samples > 1:
+            cur_var = pvar_buf[-1] if pvar_buf else 0.0
+            cur_sys = psys_buf[-1] if psys_buf else 0.0
+            last_inf_var = inf_energies_var[-1] if inf_energies_var else 0.0
+            txt_status.set_text(
+                f"VDDVAR   now={cur_var:6.2f} mW   avg={rail_acc['VDDVAR'].avg_mW():6.2f} mW   "
+                f"total={rail_acc['VDDVAR'].energy_mJ():9.2f} mJ\n"
+                f"SYS      now={cur_sys:6.2f} mW   avg={rail_acc['SYS'].avg_mW():6.2f} mW   "
+                f"total={rail_acc['SYS'].energy_mJ():9.2f} mJ\n"
+                f"inferences detected: {len(inf_energies_var)}   "
+                f"last per-inference VDDVAR energy: {last_inf_var:.4f} mJ"
+            )
+
+        return [line_var, line_sys]
+
+    # Keep a reference to the animation so it isn't garbage-collected (matplotlib
+    # silently stops drawing if the FuncAnimation goes out of scope).
+    ani = animation.FuncAnimation(
+        fig, update, interval=200, blit=False, cache_frame_data=False)
+
+    try:
+        plt.show()
+    finally:
+        stop_event.set()
+        th.join(timeout=1.0)
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    # Final summary printed to console after the window closes.
+    print("\n[power] window closed — final summary:", file=sys.stderr)
+    analyze_file(output_path, region_pin)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
@@ -388,12 +624,17 @@ def main():
         keep = False
 
     try:
+        if args.live:
+            run_live(args.port, capture_path, args.region_pin)
+            if keep:
+                print(f"Raw samples written to {capture_path}", file=sys.stderr)
+            return
         capture_to_file(args.port, capture_path, args.duration)
         analyze_file(capture_path, args.region_pin)
         if keep:
             print(f"\nRaw samples written to {capture_path}", file=sys.stderr)
     finally:
-        if not keep and os.path.exists(capture_path):
+        if not keep and not args.live and os.path.exists(capture_path):
             try:
                 os.unlink(capture_path)
             except OSError:
