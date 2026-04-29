@@ -2,9 +2,16 @@
 """
 collect_gesture_data.py
 
-Records DVS activity accumulation frames as training data for the TFLite model.
-Run this instead of webcam_to_dvs.py when collecting data. The script shows a
-live window of what the DVS accumulation looks like and saves frames to disk.
+Records DVS activity-map frames as training data for the TFLite model.
+
+Pipeline matches what the EVK actually sees at inference time:
+  webcam → grayscale → DVS event diff → KernelMirror activity map →
+  KernelMirror.model_input_uint8() (Q16 nearest-neighbor downsample to 96x96)
+
+Both the saved PNG and the live preview come from KernelMirror so there's no
+training/runtime resize-algorithm mismatch.  Imports DVSEmulator + KernelMirror
+from webcam_to_dvs.py so the host-sender pipeline and collector share one
+implementation.
 
 Usage:
   pip install opencv-python numpy
@@ -24,6 +31,7 @@ Output:
 
 import argparse
 import os
+import sys
 import time
 import numpy as np
 
@@ -32,50 +40,17 @@ try:
 except ImportError:
     raise SystemExit("opencv-python required: pip install opencv-python")
 
-# ── DVS emulation (copied from webcam_to_dvs.py) ──────────────────────────────
-THRESHOLD       = 15
-WIDTH, HEIGHT   = 160, 120
-SAVE_SIZE       = 128   # resize before saving (matches model input)
+# Import the shared DVS emulator + EVK kernel mirror from the sender script.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from webcam_to_dvs import (
+    DVSEmulator, KernelMirror,
+    EVK_SPI_MAX_EVENTS, KERNEL_INPUT_SIZE,
+)
 
-# Activity map constants (must match gesture_kernel.h)
-ACTIVITY_INCREMENT  = 80.0
-ACTIVITY_DECREMENT  = 40.0
-ACTIVITY_DECAY      = 0.92
-ACTIVITY_THRESHOLD  = 40.0
+THRESHOLD     = 8           # match the runtime sender default
+WIDTH, HEIGHT = 160, 120
 
 VALID_GESTURES = ('palm', 'fist', 'one', 'peace', 'thumb_up')
-
-
-class DVSActivityMap:
-    def __init__(self, w, h):
-        self.w = w
-        self.h = h
-        self.map = np.zeros((h, w), dtype=np.float32)
-
-    def update(self, frame_gray, prev_gray):
-        """Compute DVS events from frame diff and update activity map."""
-        self.map *= ACTIVITY_DECAY
-        self.map[self.map < 1.0] = 0.0
-
-        if prev_gray is None:
-            return
-
-        diff = frame_gray.astype(np.int16) - prev_gray.astype(np.int16)
-        on_mask  = diff >  THRESHOLD
-        off_mask = diff < -THRESHOLD
-
-        self.map[on_mask]  += ACTIVITY_INCREMENT
-        self.map[off_mask] += ACTIVITY_DECREMENT
-        np.clip(self.map, 0, 255, out=self.map)
-
-    def as_uint8(self):
-        return self.map.astype(np.uint8)
-
-    def as_rgb_uint8(self):
-        """Return (SAVE_SIZE, SAVE_SIZE, 3) uint8 — grayscale replicated to 3ch."""
-        gray = cv2.resize(self.as_uint8(), (SAVE_SIZE, SAVE_SIZE),
-                          interpolation=cv2.INTER_AREA)
-        return cv2.merge([gray, gray, gray])
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -137,8 +112,8 @@ def main():
                     return
 
         # ── Recording loop ────────────────────────────────────────────────────
-        activity = DVSActivityMap(WIDTH, HEIGHT)
-        prev_gray = None
+        emulator = DVSEmulator(WIDTH, HEIGHT, THRESHOLD)
+        mirror   = KernelMirror(WIDTH, HEIGHT)  # out_size defaults to 96
         recording = False
         saved = 0
         last_save_time = 0.0
@@ -146,6 +121,8 @@ def main():
 
         print(f"[collect] Press SPACE to start/stop recording, Q to quit")
         print(f"[collect] Target: {args.count} frames of gesture '{gesture}'")
+        print(f"[collect] Saving {KERNEL_INPUT_SIZE}x{KERNEL_INPUT_SIZE} "
+              f"PNGs (matches EVK model input)")
 
         while True:
             ret, frame = cap.read()
@@ -154,15 +131,22 @@ def main():
 
             frame_resized = cv2.resize(frame, (WIDTH, HEIGHT))
             gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
-            activity.update(gray, prev_gray)
-            prev_gray = gray
 
-            # Build display: side-by-side webcam + activity map
-            act_uint8 = activity.as_uint8()
-            act_display = cv2.applyColorMap(act_uint8, cv2.COLORMAP_HOT)
-            act_display = cv2.resize(act_display, (320, 240))
+            # Drive the EVK kernel mirror through the same path the host sender
+            # uses: frame-diff → events → ingest.  Apply the same per-frame cap
+            # the SPI sender applies, so the activity map reflects what the EVK
+            # actually receives.
+            events = emulator.process_frame(gray)
+            mirror.ingest(events[:EVK_SPI_MAX_EVENTS])
+
+            # Display: webcam (for framing) | model-input view (what the EVK sees)
             cam_display = cv2.resize(frame_resized, (320, 240))
-            display = np.hstack([cam_display, act_display])
+            model_in    = mirror.model_input_uint8()  # 96x96 grayscale
+            model_disp  = cv2.applyColorMap(
+                cv2.resize(model_in, (320, 240),
+                           interpolation=cv2.INTER_NEAREST),
+                cv2.COLORMAP_HOT)
+            display = np.hstack([cam_display, model_disp])
 
             # Status overlay
             status = f"REC {saved}/{args.count}" if recording else f"PAUSED {saved}/{args.count}"
@@ -171,16 +155,23 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.putText(display, status, (10, 55),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(display, f"events={len(events)}", (10, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
             cv2.putText(display, "SPACE=record  Q=quit", (10, 225),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-            cv2.imshow("DVS Gesture Collector  [left=webcam  right=activity]", display)
+            cv2.imshow("DVS Gesture Collector  [left=webcam  right=EVK model input]",
+                       display)
 
-            # Save frame
+            # Save frame at the model's native resolution.  Saved as 3-channel
+            # to match the model input shape (the trainer's preprocess uses the
+            # PNG's native channels, and the EVK runtime feeds 3 replicated
+            # grayscale channels — saving 3ch keeps the pipelines aligned).
             now = time.monotonic()
             if recording and (now - last_save_time) >= SAVE_INTERVAL:
                 idx = start_idx + saved
                 fname = os.path.join(out_dir, f"{gesture}_{idx:04d}.png")
-                cv2.imwrite(fname, activity.as_rgb_uint8())
+                rgb = cv2.merge([model_in, model_in, model_in])
+                cv2.imwrite(fname, rgb)
                 saved += 1
                 last_save_time = now
                 if saved >= args.count:

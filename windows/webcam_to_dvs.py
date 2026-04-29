@@ -34,7 +34,13 @@ DVS_EVENT_FMT    = "<BBbI"       # x(1) + y(1) + polarity(1) + timestamp(4)
 DVS_HEADER_SIZE  = struct.calcsize(DVS_HEADER_FMT)
 DVS_EVENT_SIZE   = struct.calcsize(DVS_EVENT_FMT)
 DVS_MAX_EVENTS       = 65535
-EVK_SPI_MAX_EVENTS   = 500    # keep frames small to avoid SPIACTIVE hang on large transfers
+EVK_SPI_MAX_EVENTS   = 2048   # matches EVK_FRAME_EVENT_CAP in dut/e1x/main.cpp
+
+# ── Kernel-mirror constants (must stay in sync with dut/common/gesture_kernel.h)
+KERNEL_DECAY        = 0.92
+KERNEL_INCREMENT    = 80.0    # per ON event
+KERNEL_DECREMENT    = 40.0    # per OFF event (kernel adds, doesn't subtract)
+KERNEL_INPUT_SIZE   = 96      # model input spatial dim
 
 DEFAULT_WIDTH    = 160
 DEFAULT_HEIGHT   = 120
@@ -178,6 +184,48 @@ class SPISender:
         pass  # pyftdi cleans up when the object is GC'd
 
 
+# ── Kernel mirror ─────────────────────────────────────────────────────────────
+# Reproduces dut/common/gesture_kernel.cpp's activity-map ingest + nearest-
+# neighbor resize so the host can preview exactly what the EVK is feeding to
+# the inference model. Use --debug-display to enable.
+
+class KernelMirror:
+    def __init__(self, w, h, out_size=KERNEL_INPUT_SIZE):
+        self.w = w
+        self.h = h
+        self.out_size = out_size
+        self.activity = np.zeros((h, w), dtype=np.float32)
+
+    def ingest(self, events):
+        # Same logic as gesture_kernel_ingest:
+        #   1. decay all cells, zero out anything below 1.0
+        #   2. for each event, add INCREMENT (ON) or DECREMENT (OFF), clip to 255
+        self.activity *= KERNEL_DECAY
+        self.activity[self.activity < 1.0] = 0.0
+
+        for x, y, pol, _ts in events:
+            if 0 <= x < self.w and 0 <= y < self.h:
+                self.activity[y, x] += KERNEL_INCREMENT if pol == 1 else KERNEL_DECREMENT
+                if self.activity[y, x] > 255.0:
+                    self.activity[y, x] = 255.0
+
+    def heatmap_uint8(self):
+        return self.activity.astype(np.uint8)
+
+    def model_input_uint8(self):
+        # Mirrors resize_activity_to_model_input: Q16-stepped nearest-neighbor.
+        step_x = (self.w << 16) // self.out_size
+        step_y = (self.h << 16) // self.out_size
+        out = np.zeros((self.out_size, self.out_size), dtype=np.uint8)
+        a = self.heatmap_uint8()
+        for oy in range(self.out_size):
+            sy = min((oy * step_y) >> 16, self.h - 1)
+            for ox in range(self.out_size):
+                sx = min((ox * step_x) >> 16, self.w - 1)
+                out[oy, ox] = a[sy, sx]
+        return out
+
+
 # ── Main loops ─────────────────────────────────────────────────────────────────
 
 def run_with_webcam(args, sender):
@@ -188,6 +236,7 @@ def run_with_webcam(args, sender):
         sys.exit(1)
 
     emulator = DVSEmulator(args.width, args.height, args.threshold)
+    mirror = KernelMirror(args.width, args.height) if args.debug_display else None
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -202,6 +251,9 @@ def run_with_webcam(args, sender):
 
     print(f"[sender] Streaming {args.width}x{args.height} @ {args.fps} FPS "
           f"(threshold={args.threshold})")
+    if args.debug_display:
+        print(f"[sender] Debug display ON — mirroring EVK activity map "
+              f"(close window or press 'q' to stop)")
     print(f"[sender] Press Ctrl+C to stop")
 
     try:
@@ -242,6 +294,23 @@ def run_with_webcam(args, sender):
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
+            if mirror is not None:
+                # Use only the events the EVK actually saw (post-cap).
+                mirror.ingest(events[:EVK_SPI_MAX_EVENTS])
+                heatmap = mirror.heatmap_uint8()
+                # Upscale 160×120 heatmap to 480×360 so it's actually visible.
+                heatmap_big = cv2.resize(heatmap, (480, 360),
+                                          interpolation=cv2.INTER_NEAREST)
+                # The model-input view, upscaled to 384×384 for inspection.
+                model_in = mirror.model_input_uint8()
+                model_big = cv2.resize(model_in, (384, 384),
+                                        interpolation=cv2.INTER_NEAREST)
+                cv2.imshow("EVK activity heatmap (160x120 → upscaled)", heatmap_big)
+                cv2.imshow(f"Model input ({KERNEL_INPUT_SIZE}x{KERNEL_INPUT_SIZE} → upscaled)",
+                           model_big)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
             frame_id += 1
 
             elapsed = time.monotonic() - t0
@@ -251,7 +320,7 @@ def run_with_webcam(args, sender):
     finally:
         cap.release()
         sender.close()
-        if args.visualize:
+        if args.visualize or args.debug_display:
             cv2.destroyAllWindows()
 
 
@@ -344,6 +413,11 @@ def main():
                         help="Video source")
     parser.add_argument("--visualize", action="store_true",
                         help="Show local DVS event visualization (requires OpenCV)")
+    parser.add_argument("--debug-display", action="store_true",
+                        help="Mirror the EVK kernel locally and display the "
+                             "activity heatmap + model-input view in OpenCV "
+                             "windows. Useful for comparing against saved "
+                             "training PNGs.")
 
     args = parser.parse_args()
 

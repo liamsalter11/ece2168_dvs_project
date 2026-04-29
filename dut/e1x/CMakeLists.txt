@@ -57,11 +57,17 @@ find_program(EFF_IMPORT_BIN eff-import REQUIRED
     HINTS ${CMAKE_CURRENT_SOURCE_DIR}/../../.venv/bin
     DOC "eff-import tool from the litert_effcc Python package")
 
+# eff-import internally invokes "ml-import" via shutil.which(), so the venv's
+# bin directory must be on PATH at compile time. srun strips inherited env by
+# default, so we set PATH explicitly here rather than relying on the caller.
+get_filename_component(EFF_IMPORT_BIN_DIR ${EFF_IMPORT_BIN} DIRECTORY)
+
 set(MODEL_MLIR ${CMAKE_CURRENT_BINARY_DIR}/gesture_inference.mlir)
 
 add_custom_command(
     OUTPUT  ${MODEL_MLIR}
-    COMMAND ${EFF_IMPORT_BIN}
+    COMMAND ${CMAKE_COMMAND} -E env "PATH=${EFF_IMPORT_BIN_DIR}:$ENV{PATH}"
+            ${EFF_IMPORT_BIN}
             ${DVS_MODEL_SRC}
             --entrypoint-name gesture_run_inference
             -o ${MODEL_MLIR}

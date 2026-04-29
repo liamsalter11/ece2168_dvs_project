@@ -203,31 +203,28 @@ static void extract_blob_features(int label, blob_features_t* feat)
     feat->compactness  = (area > 0) ? (float)(perimeter * perimeter) / area : 0.0f;
 }
 
-/* Bilinear resize uses float arithmetic — runs on the scalar core. */
+/* Resize activity[W×H] → resize_buf[OUT×OUT×CH] using fixed-point
+ * nearest-neighbor.  Float bilinear hangs the E1x scalar core (likely a
+ * softfp/FCSR issue with the released compiler), so this path is integer-
+ * indexed.  Activity values are already in [0,255], replicated across the
+ * three model channels. */
 static void resize_activity_to_model_input(void)
 {
-    /* Bilinear resize: activity (W×H float [0-255])
-     * → resize_buf (128×128×3 uint8, grayscale→3ch) */
     const int OUT = TFLM_INPUT_W;
+    const uint32_t step_x = ((uint32_t)W << 16) / OUT;  /* Q16 src/dst */
+    const uint32_t step_y = ((uint32_t)H << 16) / OUT;
 
     for (int oy = 0; oy < OUT; oy++) {
-        float sy = oy * (float)(H - 1) / (OUT - 1);
-        int   y0 = (int)sy;
-        int   y1 = (y0 + 1 < H) ? y0 + 1 : y0;
-        float fy = sy - y0;
+        int sy = (int)((oy * step_y) >> 16);
+        if (sy >= H) sy = H - 1;
 
         for (int ox = 0; ox < OUT; ox++) {
-            float sx = ox * (float)(W - 1) / (OUT - 1);
-            int   x0 = (int)sx;
-            int   x1 = (x0 + 1 < W) ? x0 + 1 : x0;
-            float fx = sx - x0;
+            int sx = (int)((ox * step_x) >> 16);
+            if (sx >= W) sx = W - 1;
 
-            float v = s_activity[y0 * W + x0] * (1.0f - fx) * (1.0f - fy)
-                    + s_activity[y0 * W + x1] *         fx  * (1.0f - fy)
-                    + s_activity[y1 * W + x0] * (1.0f - fx) *         fy
-                    + s_activity[y1 * W + x1] *         fx  *         fy;
-
+            float v = s_activity[sy * W + sx];
             uint8_t pix = (v < 0.0f) ? 0u : (v > 255.0f) ? 255u : (uint8_t)v;
+
             int base = (oy * OUT + ox) * TFLM_INPUT_CH;
             s_resize_buf[base + 0] = pix;
             s_resize_buf[base + 1] = pix;

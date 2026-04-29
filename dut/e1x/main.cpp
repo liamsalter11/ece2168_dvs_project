@@ -22,7 +22,33 @@
 #include <eff/drivers/spi.h>
 #include <eff/drivers/pinmux.h>
 #include <eff/drivers/uart.h>
+#include <eff/drivers/gpio.h>
 #include <eff/time.h>
+#endif
+
+/* AON pin used to mark inference regions for the on-board power sensors.
+ * The EVK programmer streams the AON4/AON5 line states alongside the
+ * current/voltage/power columns in /dev/eff-power, so toggling pin 4 around
+ * the inference call lets tools/power_logger.py compute per-region energy.
+ * Pin 5 is left free for a second region marker if needed. */
+#define POWER_REGION_PIN GPIO_PIN_4
+
+#ifdef HW_BUILD
+static inline void power_region_init(void) {
+    eff_pinmux_set(PINMUX_AON, PINMUX_GPIO);
+    eff_gpio_dir_set(GPIO_AON, POWER_REGION_PIN, EFF_GPIO_OUT);
+    eff_gpio_clear(GPIO_AON, POWER_REGION_PIN);
+}
+static inline void power_region_enter(void) {
+    eff_gpio_set(GPIO_AON, POWER_REGION_PIN);
+}
+static inline void power_region_exit(void) {
+    eff_gpio_clear(GPIO_AON, POWER_REGION_PIN);
+}
+#else
+static inline void power_region_init(void) {}
+static inline void power_region_enter(void) {}
+static inline void power_region_exit(void) {}
 #endif
 
 /* ── Frame receive ────────────────────────────────────────────────── */
@@ -55,7 +81,10 @@ static bool spi_init(void) {
 #endif
 }
 
-/* Returns event count on success, -1 on transfer failure, -2 on bad magic. */
+/* Returns event count on success, -1 on RX overrun, -2 on bad magic.
+ * rc == -1 from eff_spi_slave_xfer is a TX FIFO underrun; we always pass
+ * tx_size=0 so this is expected on every transfer (the master full-duplex
+ * clocks bytes out of an empty TX FIFO). RX is unaffected. */
 static int receive_frame(dvs_packet_header_t* header_out,
                          dvs_event_t*         events_out) {
 #ifndef HW_BUILD
@@ -63,10 +92,7 @@ static int receive_frame(dvs_packet_header_t* header_out,
 #else
     int8_t rc = eff_spi_slave_xfer(SPI_2, NULL, 0,
                                    s_frame_buf, sizeof(s_frame_buf));
-    if (rc == -2) {
-        /* RX overrun — host sent more than EVK_FRAME_EVENT_CAP. Drop frame. */
-        return -1;
-    }
+    if (rc == -2) return -1;
 
     if (s_frame_buf[0] != DVS_MAGIC_0 || s_frame_buf[1] != DVS_MAGIC_1) {
         return -2;
@@ -125,6 +151,8 @@ int main(void) {
         return 1;
     }
 
+    power_region_init();
+
     uart_log("Gesture recognition ready (fabric)\r\n");
 
     static dvs_packet_header_t header;
@@ -138,19 +166,21 @@ int main(void) {
     for (;;) {
         int n = receive_frame(&header, events);
 
-        if (n == -2) {
-            sprintf(line, "BAD_MAGIC %02X %02X\r\n",
-                    s_frame_buf[0], s_frame_buf[1]);
-            uart_log(line);
-            continue;
-        }
+        /* Bad magic / overrun: skip silently — host stream resync within a
+         * frame or two. Counted in the heartbeat below. */
         if (n < 0) {
-            uart_log("RX_OVERRUN\r\n");
+            frame_count++;
             continue;
         }
 
         gesture_kernel_ingest(events, (uint32_t)n);
+
+        /* Mark the inference window on AON4 so power_logger.py can split
+         * energy into in-region (classify+inference) vs out-of-region (SPI
+         * receive + parse + UART). */
+        power_region_enter();
         gesture_result_t result = gesture_kernel_classify();
+        power_region_exit();
 
         /* Heartbeat every 30 frames so we can confirm the loop is alive. */
         if ((++frame_count % 30) == 0) {
