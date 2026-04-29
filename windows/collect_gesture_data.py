@@ -47,7 +47,7 @@ from webcam_to_dvs import (
     EVK_SPI_MAX_EVENTS, KERNEL_INPUT_SIZE,
 )
 
-THRESHOLD     = 8           # match the runtime sender default
+THRESHOLD     = 15           # match the runtime sender default
 WIDTH, HEIGHT = 160, 120
 
 VALID_GESTURES = ('palm', 'fist', 'one', 'peace', 'thumb_up')
